@@ -1,12 +1,17 @@
 import React from "react"
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
+import { Montserrat } from 'next/font/google'
 import { Analytics } from '@vercel/analytics/next'
 import { AuthProvider } from '@/contexts/auth-context'
+import { ThemeProvider } from '@/components/theme-provider'
 import { Toaster } from '@/components/ui/sonner'
 import './globals.css'
 
-const inter = Inter({ subsets: ["latin"] });
+const montserrat = Montserrat({ 
+  subsets: ["latin"],
+  weight: ["400", "600", "700", "900"],
+  display: 'swap'
+});
 
 export const metadata: Metadata = {
   title: 'Smart Study Companion',
@@ -20,12 +25,19 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en">
-      <body className={`${inter.className} antialiased`}>
-        <AuthProvider>
-          {children}
-          <Toaster />
-        </AuthProvider>
+    <html lang="en" suppressHydrationWarning>
+      <body className={`${montserrat.className} antialiased font-sans`}>
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
+        >
+          <AuthProvider>
+            {children}
+            <Toaster />
+          </AuthProvider>
+        </ThemeProvider>
         <Analytics />
       </body>
     </html>

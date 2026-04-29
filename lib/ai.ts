@@ -1,3 +1,25 @@
+// ============================================================================
+// AI INTEGRATION LIBRARY
+// ============================================================================
+// This file contains all AI-powered features using OpenAI GPT-4o-mini.
+// 
+// Features implemented:
+// 1. Flashcard Generation - Creates question/answer pairs from content
+// 2. Quiz Generation - Generates multiple-choice questions with explanations
+// 3. Document Summarization - Creates structured study summaries
+// 4. Chat - Enables conversation with document content
+//
+// Technology Stack:
+// - Vercel AI SDK: Provides unified interface for AI models
+// - OpenAI GPT-4o-mini: Cost-effective model with good performance
+// - Zod: Schema validation for structured outputs
+//
+// Key Concepts:
+// - Prompt Engineering: Carefully crafted prompts ensure quality outputs
+// - Structured Output: Using Zod schemas guarantees consistent data format
+// - Content Validation: Prevents errors with insufficient content
+// ============================================================================
+
 import { generateText, generateObject } from "ai"
 import { openai } from "@ai-sdk/openai"
 import { z } from "zod"
@@ -5,18 +27,33 @@ import { z } from "zod"
 // ============================================================================
 // AI Configuration
 // ============================================================================
-
+// Using GPT-4o-mini for all AI operations
+// Why GPT-4o-mini?
+// - Cost-effective: ~10x cheaper than GPT-4
+// - Fast: Lower latency for better UX
+// - Sufficient capability: Handles educational content well
+// - Same context window: 128k tokens (plenty for documents)
 const model = openai("gpt-4o-mini")
 
 // ============================================================================
 // Content Validation
 // ============================================================================
-
+/**
+ * Validates document content before AI processing
+ * Prevents errors from empty, scanned, or image-based PDFs
+ * 
+ * @param content - The document text to validate
+ * @param minWords - Minimum number of readable words required (default: 50)
+ * @throws Error if content is insufficient or unreadable
+ */
 function validateContent(content: string, minWords: number = 50): void {
+  // Check 1: Minimum character length (200 chars = ~30-40 words)
   if (!content || content.length < 200) {
     throw new Error("Document content is too short. Please ensure the document was extracted correctly.")
   }
 
+  // Check 2: Count actual readable words (2+ letters)
+  // This catches image-based PDFs that might have gibberish characters
   const words = content.match(/\b[a-zA-Z]{2,}\b/g) || []
   if (words.length < minWords) {
     throw new Error("Document has insufficient readable content. It may be scanned or image-based.")
@@ -26,12 +63,31 @@ function validateContent(content: string, minWords: number = 50): void {
 // ============================================================================
 // Flashcard Generation
 // ============================================================================
-
+/**
+ * Generates study flashcards from document content using AI
+ * 
+ * Features:
+ * - Mixed difficulty levels (easy/medium/hard)
+ * - Multiple question types (definitions, concepts, applications)
+ * - Quality control through prompt engineering
+ * - Covers all major topics (not just first section)
+ * 
+ * @param content - Document text to generate flashcards from
+ * @param count - Number of flashcards to generate (default: 10)
+ * @returns Array of flashcard objects with front, back, and difficulty
+ */
 export async function generateFlashcards(content: string, count: number = 10) {
+  // Validate content before processing
   validateContent(content)
 
+  // ============================================================================
+  // STRUCTURED OUTPUT WITH ZOD SCHEMA
+  // ============================================================================
+  // Using generateObject instead of generateText ensures consistent format
+  // Zod schema acts as a contract - AI must return exactly this structure
   const { object } = await generateObject({
     model,
+    // Zod schema defines the expected output structure
     schema: z.object({
       flashcards: z.array(
         z.object({
@@ -41,6 +97,15 @@ export async function generateFlashcards(content: string, count: number = 10) {
         })
       ),
     }),
+    // ============================================================================
+    // PROMPT ENGINEERING FOR QUALITY FLASHCARDS
+    // ============================================================================
+    // This prompt uses several techniques:
+    // 1. Role definition: "expert educator"
+    // 2. Explicit types: Defines 5 flashcard categories
+    // 3. Quality rules: Specific constraints for front/back
+    // 4. Distribution: Mix of difficulties
+    // 5. Examples: Shows desired format
     prompt: `You are an expert educator creating study flashcards. Generate ${count} high-quality flashcards from this document.
 
 FLASHCARD TYPES TO CREATE:
@@ -69,15 +134,38 @@ Generate ${count} flashcards that would help a student master this material for 
 // ============================================================================
 // Quiz Generation
 // ============================================================================
-
+/**
+ * Generates multiple-choice quiz questions based on Bloom's Taxonomy
+ * 
+ * Bloom's Taxonomy Levels Implemented:
+ * - Recall (30%): Remember facts, definitions, numbers
+ * - Understanding (40%): Comprehend concepts and relationships
+ * - Application (30%): Apply knowledge to scenarios
+ * 
+ * Each question includes:
+ * - Clear question text
+ * - 4 plausible answer options
+ * - Index of correct answer (0-3)
+ * - Explanation of why answer is correct
+ * 
+ * @param content - Document text to generate questions from
+ * @param count - Number of questions to generate (default: 10)
+ * @returns Array of quiz question objects
+ */
 export async function generateQuizQuestions(content: string, count: number = 10) {
+  // Validate content quality
   validateContent(content)
 
+  // Debug logging for troubleshooting
   console.log("[AI] Generating quiz questions...")
   console.log("[AI]   Content length:", content.length)
 
+  // ============================================================================
+  // STRUCTURED QUIZ GENERATION
+  // ============================================================================
   const { object } = await generateObject({
     model,
+    // Zod schema ensures each question has required fields
     schema: z.object({
       questions: z.array(
         z.object({
@@ -88,6 +176,14 @@ export async function generateQuizQuestions(content: string, count: number = 10)
         })
       ),
     }),
+    // ============================================================================
+    // ADVANCED PROMPT ENGINEERING
+    // ============================================================================
+    // This prompt implements educational best practices:
+    // 1. Bloom's Taxonomy distribution
+    // 2. Answer quality guidelines (plausible distractors)
+    // 3. Specificity requirements
+    // 4. Educational value focus
     prompt: `You are creating an exam for students who studied this document. Generate ${count} questions.
 
 QUESTION TYPES (mix these):
@@ -125,7 +221,13 @@ Generate ${count} exam-quality questions that test real understanding of this ma
 // Document Summarization
 // ============================================================================
 
+/**
+ * summarizeContent — Generates a Markdown-formatted study summary
+ * Uses generateText (not generateObject) because the output is free-form prose
+ * @param content — Extracted document text to summarize
+ */
 export async function summarizeContent(content: string) {
+  // Lower minimum word threshold (30) since even short documents can be summarised
   validateContent(content, 30)
 
   const { text } = await generateText({
@@ -157,16 +259,23 @@ GUIDELINES:
 - Make it scannable with clear headers
 
 DOCUMENT CONTENT:
-${content.slice(0, 25000)}`,
+${content.slice(0, 25000)}`,  // Cap at 25 000 chars to stay within token limits
   })
 
-  return text
+  return text  // Raw Markdown string rendered by the calling component
 }
 
 // ============================================================================
 // Chat with Document
 // ============================================================================
 
+/**
+ * chatWithDocument — Answers a user's question in the context of a document
+ * Uses a system prompt to keep responses focused on the document content
+ * @param content     — The extracted document text injected into the system prompt
+ * @param userMessage — The latest user question
+ * @param chatHistory — Prior turns so the model understands conversation context
+ */
 export async function chatWithDocument(
   content: string,
   userMessage: string,
@@ -174,6 +283,7 @@ export async function chatWithDocument(
 ) {
   const { text } = await generateText({
     model,
+    // System prompt defines the AI's persona and what it should/shouldn't answer
     system: `You are a friendly study tutor helping a student understand their document.
 
 YOUR ROLE:
@@ -190,32 +300,40 @@ RESPONSE STYLE:
 - Offer to explain further if needed
 
 DOCUMENT CONTENT:
-${content.slice(0, 20000)}`,
+${content.slice(0, 20000)}`,  // Include up to 20 000 chars of document text
     messages: [
+      // Spread prior turns so the model has full conversation context
       ...chatHistory.map((msg) => ({
         role: msg.role as "user" | "assistant",
         content: msg.content,
       })),
+      // Append the new user message as the final turn
       { role: "user" as const, content: userMessage },
     ],
   })
 
-  return text
+  return text  // Plain text reply rendered in the chat UI
 }
 
 // ============================================================================
 // Topic Extraction (Internal Use)
 // ============================================================================
 
+/**
+ * extractKeyTopics — Identifies the main subjects covered in a document
+ * Used internally for context enrichment (not directly exposed to the UI)
+ * Returns structured objects with name, description, and relative importance
+ */
 export async function extractKeyTopics(content: string) {
   const { object } = await generateObject({
     model,
+    // Zod schema: array of topic objects each with name + description + importance tier
     schema: z.object({
       topics: z.array(
         z.object({
           name: z.string(),
           description: z.string(),
-          importance: z.enum(["high", "medium", "low"]),
+          importance: z.enum(["high", "medium", "low"]),  // Tier based on document emphasis
         })
       ),
     }),
@@ -227,8 +345,8 @@ For each topic:
 - Importance: high/medium/low based on how much the document emphasizes it
 
 DOCUMENT:
-${content.slice(0, 15000)}`,
+${content.slice(0, 15000)}`,  // Smaller cap — topic extraction needs less context
   })
 
-  return object.topics
+  return object.topics  // Array of { name, description, importance }
 }

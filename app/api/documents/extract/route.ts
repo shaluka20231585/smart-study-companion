@@ -1,18 +1,24 @@
-import { NextResponse } from "next/server"
-import { createClient } from "@supabase/supabase-js"
-import {
-  cleanExtractedText,
-  chunkText,
-  estimateTokenCount,
-  validateExtraction,
-  detectScannedPDF,
-  validateTextQuality,
-  sanitizeTextForAI,
-} from "@/lib/pdf-extraction-utils"
-import { storeChunks } from "@/lib/chunk-storage"
-import { extractText } from "unpdf"
+// Next.js Route Handler — POST /api/documents/extract
+// 6-step PDF processing pipeline: download → parse → detect → clean → chunk → store
 
-// Robust PDF text extraction using unpdf (works natively in Node.js)
+import { NextResponse } from "next/server"
+import { createClient } from "@supabase/supabase-js"  // Admin Supabase client for service-key operations
+import {
+  cleanExtractedText,         // Strips headers/footers/artefacts from raw PDF text
+  chunkText,                  // Splits cleaned text into overlapping token-sized chunks
+  estimateTokenCount,         // Rough token count estimate for a string (chars / 4)
+  validateExtraction,         // Checks quality/completeness of extracted text
+  detectScannedPDF,           // Returns true if text is too sparse to be machine-readable
+  validateTextQuality,        // Checks alphanumeric ratio, word count, sentence count
+  sanitizeTextForAI,          // Removes remaining control characters and encoding artefacts
+} from "@/lib/pdf-helpers"
+import { storeChunks } from "@/lib/text-chunks"  // Persists text chunks into the DB
+import { extractText } from "unpdf"                // Native Node.js PDF text extractor
+
+/**
+ * extractTextFromPDFBuffer — Low-level PDF text extraction using the unpdf library
+ * Converts the binary Buffer to Uint8Array (unpdf requirement), then joins pages
+ */
 async function extractTextFromPDFBuffer(buffer: Buffer): Promise<string> {
   try {
     console.log("[EXTRACT] Using unpdf library for text extraction")
@@ -57,42 +63,54 @@ async function extractTextFromPDFBuffer(buffer: Buffer): Promise<string> {
   }
 }
 
+// Read from environment — URL and anon key are public; service key is server-only
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY  // Not used here but available
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY        // Bypasses RLS for server-side ops
 
 // ============================================================================
 // ERROR DEFINITIONS
 // ============================================================================
 
+/**
+ * ExtractionError — Custom error class for structured pipeline failures
+ * Carries a machine-readable `code` (for the JSON response) plus optional `details`
+ */
 class ExtractionError extends Error {
   constructor(
-    public code: string,
-    message: string,
-    public details?: any
+    public code: string,    // Machine-readable error code (maps to ErrorCodes)
+    message: string,        // Human-readable description
+    public details?: any    // Optional extra context (e.g. Supabase error object)
   ) {
     super(message)
     this.name = "ExtractionError"
   }
 }
 
+// Enumeration of all possible error codes — returned in the JSON error response
 const ErrorCodes = {
-  SUPABASE_CONFIG_MISSING: "SUPABASE_CONFIG_MISSING",
-  MISSING_DOCUMENT_ID: "MISSING_DOCUMENT_ID",
-  MISSING_USER_ID: "MISSING_USER_ID",
-  DOWNLOAD_FAILED: "DOWNLOAD_FAILED",
-  PARSE_FAILED: "PARSE_FAILED",
-  EMPTY_PDF: "EMPTY_PDF",
-  SCANNED_PDF: "SCANNED_PDF",
-  CHUNK_FAILED: "CHUNK_FAILED",
-  STORAGE_FAILED: "STORAGE_FAILED",
-  INVALID_CONTENT: "INVALID_CONTENT",
+  SUPABASE_CONFIG_MISSING: "SUPABASE_CONFIG_MISSING",  // Env vars not set
+  MISSING_DOCUMENT_ID:     "MISSING_DOCUMENT_ID",      // Request body missing documentId
+  MISSING_USER_ID:         "MISSING_USER_ID",          // Request body missing userId
+  DOWNLOAD_FAILED:         "DOWNLOAD_FAILED",          // Storage download or missing filePath
+  PARSE_FAILED:            "PARSE_FAILED",             // unpdf threw an error
+  EMPTY_PDF:               "EMPTY_PDF",                // Buffer was empty
+  SCANNED_PDF:             "SCANNED_PDF",              // Too little text to be usable
+  CHUNK_FAILED:            "CHUNK_FAILED",             // Chunking step failed
+  STORAGE_FAILED:          "STORAGE_FAILED",           // DB chunk insert failed
+  INVALID_CONTENT:         "INVALID_CONTENT",          // Text quality check failed
 }
 
 // ============================================================================
 // STEP 1: VALIDATE AND RETRIEVE PDF FROM SUPABASE
 // ============================================================================
 
+/**
+ * downloadPDFFromSupabase — Downloads a PDF from Supabase Storage as a Node.js Buffer
+ * Uses the service-role admin client to bypass RLS policies for server-side access
+ * @param documentId — Used only for logging/error context
+ * @param filePath   — Storage path in format: userId/docId/filename.pdf
+ */
 async function downloadPDFFromSupabase(
   documentId: string,
   filePath: string
@@ -101,6 +119,7 @@ async function downloadPDFFromSupabase(
   console.log("[EXTRACT] Document ID:", documentId)
   console.log("[EXTRACT] File path:", filePath)
 
+  // Guard: fail early if required env vars are absent
   if (!supabaseUrl || !supabaseServiceKey) {
     throw new ExtractionError(
       ErrorCodes.SUPABASE_CONFIG_MISSING,
@@ -110,10 +129,10 @@ async function downloadPDFFromSupabase(
   }
 
   try {
-    // Create admin client with service key (server-side only)
+    // Create admin client with service key — this key bypasses RLS (server-side only)
     const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey)
 
-    // Download PDF as binary data
+    // Download PDF binary from the "documents" bucket at the given path
     const { data, error } = await supabaseAdmin.storage.from("documents").download(filePath)
 
     if (error || !data) {
@@ -124,24 +143,24 @@ async function downloadPDFFromSupabase(
       )
     }
 
-    // Convert to Node.js Buffer explicitly
-    // Supabase returns a Blob, convert to ArrayBuffer, then to Buffer
+    // Supabase returns a Web API Blob; convert to ArrayBuffer then to Node.js Buffer
+    // Node.js Buffer is required by unpdf and other server-side processing libraries
     const arrayBuffer = await data.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
     
-    // Validate buffer
+    // Sanity check: ensure the conversion produced a valid Buffer
     if (!Buffer.isBuffer(buffer)) {
       throw new Error("Failed to create valid Node.js Buffer from downloaded data")
     }
 
     console.log("[EXTRACT] ✓ PDF downloaded successfully")
     console.log("[EXTRACT]   Size:", buffer.length, "bytes")
-    console.log("[EXTRACT]   First bytes (hex):", buffer.slice(0, 4).toString("hex"))
+    console.log("[EXTRACT]   First bytes (hex):", buffer.slice(0, 4).toString("hex"))  // Should start with 25504446 (%PDF)
     console.log("[EXTRACT]   Is valid Buffer:", Buffer.isBuffer(buffer))
 
     return buffer
   } catch (error) {
-    if (error instanceof ExtractionError) throw error
+    if (error instanceof ExtractionError) throw error   // Re-throw typed errors unchanged
     throw new ExtractionError(
       ErrorCodes.DOWNLOAD_FAILED,
       "PDF download failed: " + (error instanceof Error ? error.message : String(error))
@@ -251,17 +270,28 @@ function generateChunks(cleanedText: string): string[] {
 // MAIN EXTRACTION ROUTE
 // ============================================================================
 
+/**
+ * POST /api/documents/extract
+ * Orchestrates the 6-step PDF processing pipeline:
+ * 1. Download PDF bytes from Supabase Storage
+ * 2. Parse text with unpdf
+ * 3. Detect if PDF is scanned/image-based (not extractable)
+ * 4. Clean the raw text (strip noise, normalise whitespace)
+ * 4.5 Validate text quality for AI consumption
+ * 5. Chunk text into overlapping token-sized segments
+ * 6. Store chunks in the database + update document status to "ready"
+ */
 export async function POST(request: Request) {
-  const startTime = Date.now()
+  const startTime = Date.now()  // Track total pipeline duration for logging
 
   try {
-    // Parse request body
+    // Parse JSON body — sent by pdf-upload-dialog.tsx after file upload completes
     const body = await request.json()
     console.log("[EXTRACT] Request body received:", body)
     
     const { documentId, userId, filePath } = body
 
-    // Validate inputs
+    // Input validation — fail fast with specific error codes before doing any work
     if (!documentId) {
       throw new ExtractionError(ErrorCodes.MISSING_DOCUMENT_ID, "Document ID is required")
     }
@@ -272,6 +302,7 @@ export async function POST(request: Request) {
     }
 
     if (!filePath) {
+      // filePath is needed to download from Storage — can't derive it server-side
       throw new ExtractionError(
         ErrorCodes.DOWNLOAD_FAILED,
         "File path is required for server-side download"
@@ -297,6 +328,7 @@ export async function POST(request: Request) {
     // ════════ STEP 3: DETECT EXTRACTABILITY ════════
     const extractability = detectExtractability(rawText, pageCount)
 
+    // Abort the pipeline early if the PDF is scanned \u2014 no point cleaning unusable text
     if (!extractability.isExtractable) {
       throw new ExtractionError(
         ErrorCodes.SCANNED_PDF,
@@ -319,10 +351,10 @@ export async function POST(request: Request) {
     console.log("[EXTRACT]   Avg word length:", qualityCheck.metrics.avgWordLength.toFixed(2))
     
     if (!qualityCheck.valid) {
-      console.error("[EXTRACT] ✗ Text quality validation FAILED")
+      console.error("[EXTRACT] \u2717 Text quality validation FAILED")
       console.error("[EXTRACT] Reason:", qualityCheck.reason)
       
-      // Show preview of what was extracted
+      // Log a preview of the problematic extracted text to aid debugging
       const preview = cleanedText.substring(0, 500)
       console.error("[EXTRACT] Extracted text preview:", preview)
       
@@ -332,9 +364,9 @@ export async function POST(request: Request) {
       )
     }
     
-    console.log("[EXTRACT] ✓ Text quality validation passed")
+    console.log("[EXTRACT] \u2713 Text quality validation passed")
     
-    // Sanitize text for AI consumption (remove any remaining artifacts)
+    // Remove any remaining encoding artefacts before passing to AI models
     const sanitizedText = sanitizeTextForAI(cleanedText)
     console.log("[EXTRACT]   Sanitized text length:", sanitizedText.length)
 
@@ -344,6 +376,7 @@ export async function POST(request: Request) {
     // ════════ STEP 6: STORE CHUNKS ════════
     console.log("[EXTRACT] STEP 6: Storing chunks in database")
 
+    // Guard: service key required for chunk storage (bypasses RLS)
     if (!supabaseUrl || !supabaseServiceKey) {
       throw new ExtractionError(
         ErrorCodes.SUPABASE_CONFIG_MISSING,
@@ -351,7 +384,7 @@ export async function POST(request: Request) {
       )
     }
 
-    // Use service role for server-side chunk storage (bypasses RLS)
+    // Create admin client specifically for chunk insertion (bypasses RLS)
     const supabaseClient = createClient(supabaseUrl, supabaseServiceKey)
     const storageResult = await storeChunks(supabaseClient, documentId, userId, chunks)
 
@@ -359,7 +392,7 @@ export async function POST(request: Request) {
       throw new ExtractionError(ErrorCodes.STORAGE_FAILED, "Failed to store chunks", storageResult.error)
     }
 
-    console.log("[EXTRACT] ✓ Chunks stored successfully")
+    console.log("[EXTRACT] \u2713 Chunks stored successfully")
 
     // ════════ UPDATE DOCUMENT STATUS ════════
     console.log("[EXTRACT] Updating document status to 'ready'")
@@ -367,23 +400,23 @@ export async function POST(request: Request) {
     const updateResult = await supabaseClient
       .from("documents")
       .update({
-        status: "ready",
-        page_count: pageCount,
+        status:     "ready",              // Mark document as fully processed and available
+        page_count: pageCount,            // Store page count for display in the UI
         updated_at: new Date().toISOString(),
       })
       .eq("id", documentId)
 
     if (updateResult.error) {
+      // Log but don't fail \u2014 chunks are stored and usable even if this metadata update fails
       console.error("[EXTRACT] Warning: Failed to update document status:", updateResult.error)
-      // Don't throw - chunks are stored, this is just metadata
     }
 
     // ════════ VALIDATION & STATS ════════
-    const validation = validateExtraction(cleanedText, pageCount)
-    const duration = Date.now() - startTime
+    const validation = validateExtraction(cleanedText, pageCount)  // Final quality summary
+    const duration = Date.now() - startTime                         // Total pipeline time in ms
 
     console.log(
-      "\n[EXTRACT] ════════════════════════════════════════════════════════════════"
+      "\n[EXTRACT] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
     )
     console.log("[EXTRACT] EXTRACTION COMPLETED SUCCESSFULLY")
     console.log("[EXTRACT] Duration:", duration, "ms")
@@ -391,26 +424,28 @@ export async function POST(request: Request) {
     console.log("[EXTRACT] Total tokens:", validation.estimatedTokens)
     console.log("[EXTRACT] Total chunks:", validation.chunkCount)
     console.log(
-      "[EXTRACT] ════════════════════════════════════════════════════════════════\n"
+      "[EXTRACT] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n"
     )
 
+    // Return all stats to the client so the upload dialog can show "X pages"
     return NextResponse.json({
       success: true,
       documentId,
       extractedTextLength: cleanedText.length,
       pageCount,
-      chunkCount: chunks.length,
-      totalTokens: storageResult.totalTokens,
-      extractionQuality: validation.quality,
-      isScanned: validation.isScanned,
+      chunkCount:         chunks.length,
+      totalTokens:        storageResult.totalTokens,
+      extractionQuality:  validation.quality,
+      isScanned:          validation.isScanned,
       duration,
     })
   } catch (error) {
-    const duration = Date.now() - startTime
+    const duration = Date.now() - startTime  // Still capture duration even on failure
 
     if (error instanceof ExtractionError) {
+      // Typed error: return structured JSON with error code for client-side handling
       console.error(
-        "\n[EXTRACT] ❌ EXTRACTION FAILED:",
+        "\n[EXTRACT] \u274c EXTRACTION FAILED:",
         error.code,
         "-",
         error.message
@@ -422,25 +457,25 @@ export async function POST(request: Request) {
 
       return NextResponse.json(
         {
-          success: false,
-          error: error.message,
-          errorCode: error.code,
-          details: error.details,
+          success:   false,
+          error:     error.message,
+          errorCode: error.code,   // Machine-readable code for client error mapping
+          details:   error.details,
           duration,
         },
         { status: 400 }
       )
     }
 
-    // Unknown error
+    // Untyped / unexpected error \u2014 return 500 with minimal details
     const errorMessage = error instanceof Error ? error.message : String(error)
-    console.error("\n[EXTRACT] ❌ UNEXPECTED ERROR:", errorMessage)
+    console.error("\n[EXTRACT] \u274c UNEXPECTED ERROR:", errorMessage)
     console.error("[EXTRACT] Duration:", duration, "ms\n")
 
     return NextResponse.json(
       {
         success: false,
-        error: "Unexpected extraction error",
+        error:   "Unexpected extraction error",
         details: errorMessage,
         duration,
       },

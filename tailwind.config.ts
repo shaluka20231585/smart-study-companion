@@ -10,6 +10,10 @@ const config: Config = {
   ],
   theme: {
     extend: {
+      fontFamily: {
+        sans: ['Montserrat', 'Segoe UI', 'sans-serif'],
+        mono: ['Courier New', 'monospace'],
+      },
       colors: {
         background: 'hsl(var(--background))',
         foreground: 'hsl(var(--foreground))',
@@ -66,6 +70,20 @@ const config: Config = {
         lg: 'var(--radius)',
         md: 'calc(var(--radius) - 2px)',
         sm: 'calc(var(--radius) - 4px)',
+      },
+      boxShadow: {
+        'neo-sm': '2px 2px 0 rgba(0, 0, 0, 0.1)',
+        'neo': '4px 4px 0 rgba(0, 0, 0, 0.15)',
+        'neo-lg': '6px 6px 0 rgba(0, 0, 0, 0.2)',
+        'neo-xl': '8px 8px 0 rgba(0, 0, 0, 0.25)',
+        'neo-2xl': '12px 12px 0 rgba(0, 0, 0, 0.3)',
+      },
+      borderWidth: {
+        '3': '3px',
+        '4': '4px',
+        '6': '6px',
+        '8': '8px',
+        '12': '12px',
       },
       keyframes: {
         'accordion-down': {
